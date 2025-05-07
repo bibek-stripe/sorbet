@@ -96,9 +96,27 @@ struct FullyQualifiedName {
     }
 };
 
+// TODO(jez) Add a ClassOrModuleRef here in addition to the mangledName.
+//
+// It's going to be difficult to get rid of the fullName and replace it with only using the symbol
+// until we truly start entering packages, because the binary search relies on lexicographical
+// sorting of fullName parts, and hydrating those on the fly instead of just precomputing them all
+// once sounds much better for now (and we can get rid of the lex sort when we are able to look up
+// packages by a PackageRef id in a hashmap).
 struct PackageName {
     core::packages::MangledName mangledName;
     FullyQualifiedName fullName;
+
+    // The ClassOrModuleRef that this package is stored in.
+    //
+    // This is only to ease the transition to storing packages in the symbol table--eventually,
+    // there will just be a symbol kind for packages.
+    //
+    // I've called this owner because when Packages are in the symbol table, they will be owned
+    // by ClassOrModule symbols.
+    core::ClassOrModuleRef owner;
+
+    PackageName(FullyQualifiedName &&fullName, core::ClassOrModuleRef owner) : fullName(move(fullName)), owner(owner) {}
 
     // Pretty print the package's (user-observable) name (e.g. Foo::Bar)
     string toString(const core::GlobalState &gs) const {
@@ -690,16 +708,34 @@ FullyQualifiedName getFullyQualifiedName(core::Context ctx, const ast::Unresolve
     return fqn;
 }
 
-// Gets the package name in `tree` if applicable.
-PackageName getPackageName(core::Context ctx, const ast::UnresolvedConstantLit *constantLit) {
+PackageName getPackageName(core::Context ctx, const ast::UnresolvedConstantLit *constantLit,
+                           core::ClassOrModuleRef symbol) {
     ENFORCE(constantLit != nullptr);
 
-    PackageName pName;
-    pName.fullName = getFullyQualifiedName(ctx, constantLit);
+    return PackageName(getFullyQualifiedName(ctx, constantLit), symbol);
+}
 
-    // pname.mangledName will be populated later, when we have a mutable GlobalState
+PackageName getUnresolvedPackageName(core::Context ctx, const ast::UnresolvedConstantLit *constantLit) {
+    ENFORCE(constantLit != nullptr);
 
-    return pName;
+    auto fullName = getFullyQualifiedName(ctx, constantLit);
+
+    // Since packager now runs after namer, we know that these symbols are entered.
+    auto owner = core::Symbols::PackageSpecRegistry();
+    for (auto part : fullName.parts) {
+        auto member = owner.data(ctx)->findMember(ctx, part);
+        if (!member.exists() || !member.isClassOrModule()) {
+            owner = core::Symbols::noClassOrModule();
+            break;
+        }
+        owner = member.asClassOrModuleRef();
+    }
+
+    if (owner == core::Symbols::PackageSpecRegistry()) {
+        owner = core::Symbols::noClassOrModule();
+    }
+
+    return PackageName(move(fullName), owner);
 }
 
 bool recursiveVerifyConstant(core::Context ctx, core::NameRef fun, const ast::ExpressionPtr &root,
@@ -1231,7 +1267,7 @@ struct PackageSpecBodyWalk {
                 auto importArg = move(posArg);
                 posArg = ast::packager::prependRegistry(move(importArg));
 
-                info.importedPackageNames.emplace_back(getPackageName(ctx, target), method2ImportType(send));
+                info.importedPackageNames.emplace_back(getUnresolvedPackageName(ctx, target), method2ImportType(send));
             }
         }
 
@@ -1273,7 +1309,8 @@ struct PackageSpecBodyWalk {
                     auto &posArg = send.getPosArg(0);
                     auto importArg = move(target->recv);
                     posArg = ast::packager::prependRegistry(move(importArg));
-                    info.visibleTo_.emplace_back(getPackageName(ctx, recv), core::packages::VisibleToType::Wildcard);
+                    info.visibleTo_.emplace_back(getUnresolvedPackageName(ctx, recv),
+                                                 core::packages::VisibleToType::Wildcard);
                 } else {
                     if (auto e = ctx.beginError(target->loc, core::errors::Packager::InvalidConfiguration)) {
                         e.setHeader("Argument to `{}` must be a constant or the string literal `{}`",
@@ -1286,7 +1323,8 @@ struct PackageSpecBodyWalk {
                 auto importArg = move(posArg);
                 posArg = ast::packager::prependRegistry(move(importArg));
 
-                info.visibleTo_.emplace_back(getPackageName(ctx, target), core::packages::VisibleToType::Normal);
+                info.visibleTo_.emplace_back(getUnresolvedPackageName(ctx, target),
+                                             core::packages::VisibleToType::Normal);
             }
         }
 
@@ -1540,8 +1578,8 @@ unique_ptr<PackageInfoImpl> definePackage(const core::GlobalState &gs, ast::Pars
         auto nameTree = ast::cast_tree<ast::ConstantLit>(packageSpecClass->name);
         ENFORCE(nameTree != nullptr, "Invariant from rewriter");
 
-        return make_unique<PackageInfoImpl>(getPackageName(ctx, nameTree->original()), ctx.locAt(packageSpecClass->loc),
-                                            ctx.locAt(packageSpecClass->declLoc));
+        return make_unique<PackageInfoImpl>(getPackageName(ctx, nameTree->original(), packageSpecClass->symbol),
+                                            ctx.locAt(packageSpecClass->loc), ctx.locAt(packageSpecClass->declLoc));
     }
 
     return nullptr;
